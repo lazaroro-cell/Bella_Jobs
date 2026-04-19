@@ -1,0 +1,14 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: 'Nunito', 'Segoe UI', sans-serif;
+  background: #faf8f4;
+  color: #2d2820;
+}
+input::placeholder { color: #c9a98a; }
+button { cursor: pointer; }
+a { color: inherit; text-decoration: none; }
+textarea { font-family: inherit; }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #faf8f4; }
+::-webkit-scrollbar-thumb { background: #f0d8c0; border-radius: 10px; }
