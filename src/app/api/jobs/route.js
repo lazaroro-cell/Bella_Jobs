@@ -1,75 +1,88 @@
+// Free APIs: The Muse + Remotive — no API key needed
+
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const query    = searchParams.get("q") || "";
   const location = searchParams.get("location") || "Boston, MA";
-  const jobType  = searchParams.get("type") || "";
-  const page     = searchParams.get("page") || "1";
+  const page     = parseInt(searchParams.get("page") || "1");
 
-  const APP_ID  = process.env.ADZUNA_APP_ID;
-  const APP_KEY = process.env.ADZUNA_APP_KEY;
+  const isRemote = location.toLowerCase().includes("remote");
 
-  if (!APP_ID || !APP_KEY) {
-    return Response.json({ error: "API keys not configured" }, { status: 500 });
-  }
-
-  // Build Adzuna query params
-  const params = new URLSearchParams({
-    app_id:   APP_ID,
-    app_key:  APP_KEY,
-    results_per_page: "12",
-    what:     query,
-    where:    location,
-    content_type: "application/json",
-    page,
-  });
-
-  // Map job type
-  if (jobType === "parttime")   params.set("full_time", "0");
-  if (jobType === "fulltime")   params.set("full_time", "1");
-  if (jobType === "contract")   params.set("contract",  "1");
-  if (jobType === "internship") params.set("permanent", "0");
-
+  // Try The Muse first (free, covers Boston + remote, entry level)
   try {
-    const url = `https://api.adzuna.com/v1/api/jobs/us/search/${page}?${params}`;
-    const res = await fetch(url, { next: { revalidate: 300 } }); // cache 5 min
-
-    if (!res.ok) {
-      const text = await res.text();
-      return Response.json({ error: "Adzuna error", detail: text }, { status: res.status });
+    const museParams = new URLSearchParams({
+      query,
+      page: page - 1,
+      results_per_page: 10,
+      descending: true,
+    });
+    if (isRemote) {
+      museParams.append("location", "Flexible / Remote");
+    } else {
+      museParams.append("location", "Boston, MA, US");
+      museParams.append("location", "Flexible / Remote");
     }
+    museParams.append("level", "Entry Level");
+    museParams.append("level", "Mid Level");
 
-    const data = await res.json();
+    const museRes = await fetch(
+      `https://www.themuse.com/api/public/jobs?${museParams}`,
+      { headers: { Accept: "application/json" }, next: { revalidate: 300 } }
+    );
 
-    // Normalize results
-    const jobs = (data.results || []).map(job => ({
-      id:          job.id,
-      title:       job.title,
-      company:     job.company?.display_name || "Company not listed",
-      location:    job.location?.display_name || location,
-      description: job.description,
-      salary_min:  job.salary_min ? Math.round(job.salary_min) : null,
-      salary_max:  job.salary_max ? Math.round(job.salary_max) : null,
-      salary:      formatSalary(job.salary_min, job.salary_max),
-      posted:      formatDate(job.created),
-      url:         job.redirect_url,
-      remote:      isRemote(job),
-      type:        job.contract_time === "full_time" ? "Full-time" : job.contract_time === "part_time" ? "Part-time" : job.contract_type === "contract" ? "Contract" : "Part-time",
-      category:    job.category?.label || "",
-    }));
+    if (museRes.ok) {
+      const museData = await museRes.json();
+      if ((museData.results || []).length > 0) {
+        const jobs = museData.results.map(job => ({
+          id:          String(job.id),
+          title:       job.name,
+          company:     job.company?.name || "Company",
+          location:    (job.locations || []).map(l => l.name).join(" / ") || "See listing",
+          description: stripHtml(job.contents || "").slice(0, 350),
+          salary:      null,
+          posted:      formatDate(job.publication_date),
+          url:         job.refs?.landing_page || `https://www.themuse.com/jobs/${job.id}`,
+          remote:      (job.locations || []).some(l =>
+            l.name?.toLowerCase().includes("remote") || l.name?.toLowerCase().includes("flexible")
+          ),
+          type:        "See listing",
+          category:    (job.categories || []).map(c => c.name).join(", "),
+        }));
+        return Response.json({ jobs, total: museData.total || jobs.length });
+      }
+    }
+  } catch (_) {}
 
-    return Response.json({ jobs, total: data.count || 0 });
-  } catch (err) {
-    return Response.json({ error: err.message }, { status: 500 });
-  }
+  // Fallback: Remotive (free, remote jobs only)
+  try {
+    const remotiveRes = await fetch(
+      `https://remotive.com/api/remote-jobs?search=${encodeURIComponent(query)}&limit=10`,
+      { next: { revalidate: 300 } }
+    );
+    if (remotiveRes.ok) {
+      const remotiveData = await remotiveRes.json();
+      const jobs = (remotiveData.jobs || []).slice(0, 10).map(job => ({
+        id:          String(job.id),
+        title:       job.title,
+        company:     job.company_name,
+        location:    job.candidate_required_location || "Remote",
+        description: stripHtml(job.description || "").slice(0, 350),
+        salary:      job.salary || null,
+        posted:      formatDate(job.publication_date),
+        url:         job.url,
+        remote:      true,
+        type:        job.job_type || "Full-time",
+        category:    job.category || "",
+      }));
+      return Response.json({ jobs, total: jobs.length });
+    }
+  } catch (_) {}
+
+  return Response.json({ jobs: [], total: 0 });
 }
 
-function formatSalary(min, max) {
-  if (!min && !max) return null;
-  const fmt = (n) => n >= 1000 ? `$${Math.round(n / 1000)}k` : `$${Math.round(n)}/hr`;
-  if (min && max) return `${fmt(min)} – ${fmt(max)}`;
-  if (min) return `From ${fmt(min)}`;
-  if (max) return `Up to ${fmt(max)}`;
-  return null;
+function stripHtml(html) {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function formatDate(dateStr) {
@@ -77,12 +90,7 @@ function formatDate(dateStr) {
   const diff = Math.floor((Date.now() - new Date(dateStr)) / 86400000);
   if (diff === 0) return "Today";
   if (diff === 1) return "Yesterday";
-  if (diff < 7)  return `${diff} days ago`;
+  if (diff < 7) return `${diff} days ago`;
   if (diff < 30) return `${Math.floor(diff / 7)} week${Math.floor(diff / 7) > 1 ? "s" : ""} ago`;
   return `${Math.floor(diff / 30)} month${Math.floor(diff / 30) > 1 ? "s" : ""} ago`;
-}
-
-function isRemote(job) {
-  const text = `${job.title} ${job.description} ${job.location?.display_name || ""}`.toLowerCase();
-  return text.includes("remote") || text.includes("work from home") || text.includes("wfh");
 }
