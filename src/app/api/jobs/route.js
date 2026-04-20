@@ -23,10 +23,16 @@ const CANDIDATE_CAP = 60;    // cap work per source so we don't hammer upstreams
 
 // Bella is an entry-level candidate looking for part-time work. Titles
 // matching this pattern are out of reach regardless of how well they score.
+// Blocked buckets:
+//   - explicit seniority: senior/sr/staff/principal/distinguished/director/vp/chief
+//   - people management: supervisor/manager/mgr/head of
+//   - skilled IC roles that require CS/PhD-level credentials:
+//     engineer/developer/architect/scientist/consultant/advisor
+//   - "Lead" covers Tech Lead / Team Lead / Marketing Lead etc — at the cost of
+//     losing "Lead Generation Specialist" (rarely shows up in these APIs anyway)
 // "Executive Assistant" is intentionally NOT blocked (it's "assistant to an
-// executive", an accessible admin role). "Lead" is not blocked because
-// "Lead Generation Specialist" is often entry-level.
-const SENIOR_TITLE_RE = /\b(senior|sr\.?|staff|principal|architect|director|distinguished|supervisor|advisor|chief|vp|manager|mgr\.?|head\s+of)\b/i;
+// executive", an accessible admin role).
+const SENIOR_TITLE_RE = /\b(senior|sr\.?|staff|principal|architect|director|distinguished|supervisor|advisor|chief|vp|manager|mgr\.?|head\s+of|lead|scientist|engineer|developer|consultant)\b/i;
 
 // Job-title words that are too generic to be the "distinctive" match on their
 // own. "Office Assistant" must not count as a hit for "teaching assistant".
