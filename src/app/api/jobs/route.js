@@ -14,8 +14,25 @@ const MUSE_BASE     = "https://www.themuse.com/api/public/jobs";
 const REMOTIVE_BASE = "https://remotive.com/api/remote-jobs";
 const FETCH_OPTS    = { headers: { Accept: "application/json" }, next: { revalidate: 600 } };
 const MAX_RESULTS   = 15;
-const MIN_SCORE     = 5;     // below this, a candidate is considered irrelevant
+const MIN_SCORE     = 7;     // below this, a candidate is considered irrelevant
 const CANDIDATE_CAP = 60;    // cap work per source so we don't hammer upstreams
+
+// Job-title words that are too generic to be the "distinctive" match on their
+// own. "Office Assistant" must not count as a hit for "teaching assistant".
+// Also level/tenure words — self-describing, not content.
+const GENERIC_TOKENS = new Set([
+  "assistant", "associate", "coordinator", "specialist", "manager", "analyst",
+  "representative", "rep", "support", "agent", "lead", "senior", "junior",
+  "director", "vp", "head", "chief", "officer", "worker", "staff",
+  "entry", "intern", "internship", "contract", "temp",
+]);
+
+// Words removed entirely before tokenization — pure connectives or modality
+// tags that the location/type filters already handle.
+const STOP_TOKENS = new Set([
+  "and", "the", "for", "with", "job", "jobs", "part", "time",
+  "remote", "online", "hybrid", "flexible", "flex",
+]);
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
@@ -42,9 +59,10 @@ export async function GET(request) {
   }
 
   const scored = [];
+  const noQuery = !analyzed.tokens.length || analyzed.allGeneric;
   for (const job of byId.values()) {
     const score = scoreJob(job, analyzed);
-    if (score >= MIN_SCORE || !analyzed.tokens.length) {
+    if (noQuery || score >= MIN_SCORE) {
       scored.push({ job, score });
     }
   }
@@ -149,52 +167,97 @@ function shapeMuse(job, id) {
 
 // ─── RELEVANCE SCORING ───────────────────────────────────────────────────────
 //
+// Matching uses left-bounded (prefix-bounded) stems: `\bteach` matches
+// "teacher" and "teaching" but not "ruteach" — and critically `\bart` does
+// not match "parts" (the "a" in "parts" isn't at a word boundary).
+//
+// Gate (multi-token queries): at least one NON-generic token must have a
+// prefix-bounded stem hit in the title or category. OR semantics so
+// "baker pastry" matches "Senior Baker" AND "Pastry Chef", while "Office
+// Assistant" is still blocked for "teaching assistant" (the only non-generic
+// token, "teaching", is absent). The scorer does the actual ranking; the
+// gate just guarantees no totally-irrelevant results slip through.
+//
 // Points:
-//   +15  exact phrase in title (only for multi-word queries)
-//   +10  every token has a stem-match in title (AND)
-//   + 5  any stem-match in title (per stem)
-//   + 3  any stem-match in category (per stem)
-//   + 2  every token has a stem-match in description (AND)
-// MIN_SCORE=5 means we require at least one solid title hit OR a phrase match.
+//   +15  exact phrase appears in title
+//   +10  every token has a prefix-bounded stem in title
+//   + 5  per stem hit in title
+//   + 3  per stem hit in category
+//   + 2  every token prefix-stem-matches in description
 
 function scoreJob(job, a) {
-  if (!a.tokens.length) return 1;
+  // No content tokens (empty query, or tokens entirely generic like "entry"):
+  // skip filtering and treat everything as a potential match. This is what
+  // makes the "Any Remote" pill (q="remote part time entry" → ["entry"]) work.
+  if (!a.tokens.length || a.allGeneric) return 1;
 
   const title = (job.title || "").toLowerCase();
   const category = (job.category || "").toLowerCase();
   const desc = (job.description || "").toLowerCase();
+  const titleCat = `${title} ${category}`;
+
+  // Gate:
+  //   - Multi-token query: at least one NON-generic token must prefix-stem-hit
+  //     in title or category. OR semantics, so "baker pastry" matches both
+  //     "Senior Baker" and "Pastry Chef" while still blocking "Office
+  //     Assistant" from matching "teaching assistant".
+  //   - Single-token query: the token must prefix-stem-hit in title, category,
+  //     or description.
+  if (a.tokens.length > 1) {
+    const nonGeneric = a.tokens.filter(t => !GENERIC_TOKENS.has(t));
+    if (!nonGeneric.length || !nonGeneric.some(t => prefixStemHit(titleCat, t))) {
+      return 0;
+    }
+  } else {
+    if (!prefixStemHit(`${titleCat} ${desc}`, a.tokens[0])) return 0;
+  }
 
   let score = 0;
 
   if (a.phrase.includes(" ") && title.includes(a.phrase)) score += 15;
 
-  if (a.tokens.every(t => stemHit(title, t))) score += 10;
+  if (a.tokens.every(t => prefixStemHit(title, t))) score += 10;
 
   for (const s of a.stems) {
-    if (title.includes(s)) score += 5;
+    if (prefixHit(title, s)) score += 5;
   }
   for (const s of a.stems) {
-    if (category.includes(s)) score += 3;
+    if (prefixHit(category, s)) score += 3;
   }
-  if (a.tokens.every(t => stemHit(desc, t))) score += 2;
+  if (a.tokens.every(t => prefixStemHit(desc, t))) score += 2;
 
   return score;
+}
+
+// Left-bounded: term must start at a word boundary but the word can continue.
+// \bteach matches "teacher", "teaching", "teach" — but \bart in "parts" fails
+// because "a" is preceded by "p" (word char).
+function prefixHit(text, term) {
+  return new RegExp(`\\b${term}`, "i").test(text);
+}
+
+function prefixStemHit(text, term) {
+  return stemVariants(term).some(v => prefixHit(text, v));
 }
 
 // ─── QUERY ANALYSIS ──────────────────────────────────────────────────────────
 
 function analyze(query) {
-  const stop = new Set(["and", "the", "for", "with", "job", "jobs", "part", "time"]);
   const phrase = query.toLowerCase().trim();
   const tokens = phrase
     .split(/[^a-z0-9]+/)
-    .filter(t => t.length >= 3 && !stop.has(t));
+    .filter(t => t.length >= 3 && !STOP_TOKENS.has(t));
 
   const stems = new Set();
   for (const t of tokens) {
     for (const v of stemVariants(t)) stems.add(v);
   }
-  return { phrase, tokens, stems: [...stems] };
+
+  // True when the user's query contains only self-describing/qualifier words
+  // (all tokens are generic). Treat as no-query so we return recent jobs.
+  const allGeneric = tokens.length > 0 && tokens.every(t => GENERIC_TOKENS.has(t));
+
+  return { phrase, tokens, stems: [...stems], allGeneric };
 }
 
 function stemVariants(term) {
@@ -207,15 +270,11 @@ function stemVariants(term) {
   return out;
 }
 
-function stemHit(text, term) {
-  return stemVariants(term).some(v => text.includes(v));
-}
-
 function mostDistinctiveToken(query) {
-  const stop = new Set(["and", "the", "for", "with", "job", "jobs", "part", "time", "remote", "entry"]);
-  const toks = query.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 4 && !stop.has(t));
+  const toks = query.toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t.length >= 4 && !STOP_TOKENS.has(t) && !GENERIC_TOKENS.has(t));
   if (!toks.length) return "";
-  // Prefer the longest token (tends to be the most content-bearing word).
   return toks.sort((a, b) => b.length - a.length)[0];
 }
 
