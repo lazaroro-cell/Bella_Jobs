@@ -1,65 +1,86 @@
 // Free APIs: Remotive (remote jobs) + The Muse (Boston + remote)
 // No API keys required. Paid plans not used.
 //
-// Why this route exists in its current shape:
-//   - The Muse's public `query` param is silently ignored by the upstream API
-//     (totals stay identical regardless of keywords), so keyword matching for
-//     Muse has to happen client-side after the fetch.
-//   - Remotive's `search` is strict phrase-match: "graphic design" returns 0
-//     while "designer" returns many. We fall back to a narrower term when the
-//     full phrase is empty.
+// Design notes:
+//   - The Muse's public `query` param is silently ignored upstream, so keyword
+//     matching must happen here after the fetch.
+//   - Remotive's `search` is strict phrase-match: "graphic design" → 0 while
+//     "designer" → many. We fetch both strict and loose, then re-rank.
+//   - We score every candidate with a title-weighted relevance function and
+//     drop anything below MIN_SCORE. Fewer, accurate results beat a long list
+//     of "Office Assistant" for a "graphic designer" search.
 
 const MUSE_BASE     = "https://www.themuse.com/api/public/jobs";
 const REMOTIVE_BASE = "https://remotive.com/api/remote-jobs";
 const FETCH_OPTS    = { headers: { Accept: "application/json" }, next: { revalidate: 600 } };
 const MAX_RESULTS   = 15;
+const MIN_SCORE     = 5;     // below this, a candidate is considered irrelevant
+const CANDIDATE_CAP = 60;    // cap work per source so we don't hammer upstreams
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const query    = (searchParams.get("q") || "").trim();
   const location = (searchParams.get("location") || "Boston, MA").trim();
-
   const isRemote = /remote|flexible/i.test(location);
 
+  const analyzed = analyze(query);
+
   const tasks = isRemote
-    ? [remotiveSearch(query), museSearch(query, "remote")]
-    : [museSearch(query, "boston")];
+    ? [remotiveFetch(query), museFetch("remote")]
+    : [museFetch("boston")];
 
   const settled = await Promise.allSettled(tasks);
-  const buckets = settled.map(s => (s.status === "fulfilled" ? s.value : []));
-
-  const seen = new Set();
-  const jobs = [];
-  for (const bucket of buckets) {
-    for (const job of bucket) {
-      if (seen.has(job.id)) continue;
-      seen.add(job.id);
-      jobs.push(job);
-      if (jobs.length >= MAX_RESULTS) break;
-    }
-    if (jobs.length >= MAX_RESULTS) break;
+  const candidates = [];
+  for (const s of settled) {
+    if (s.status === "fulfilled" && Array.isArray(s.value)) candidates.push(...s.value);
   }
 
+  // Dedupe first (same id could come from both sources, or across fallback terms)
+  const byId = new Map();
+  for (const job of candidates) {
+    if (!byId.has(job.id)) byId.set(job.id, job);
+  }
+
+  const scored = [];
+  for (const job of byId.values()) {
+    const score = scoreJob(job, analyzed);
+    if (score >= MIN_SCORE || !analyzed.tokens.length) {
+      scored.push({ job, score });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score);
+
+  const jobs = scored.slice(0, MAX_RESULTS).map(x => x.job);
   return Response.json({ jobs, total: jobs.length });
 }
 
-// ─── REMOTIVE ────────────────────────────────────────────────────────────────
+// ─── FETCH: REMOTIVE ─────────────────────────────────────────────────────────
 
-async function remotiveSearch(query) {
-  const terms = buildFallbackTerms(query);
+async function remotiveFetch(query) {
+  // Pull with strict phrase AND with the most distinctive single token.
+  // The scorer drops loose matches later, so casting a slightly wider net is fine.
+  const q = query.trim();
+  const terms = new Set();
+  if (q) terms.add(q);
+  const distinctive = mostDistinctiveToken(q);
+  if (distinctive && distinctive !== q) terms.add(distinctive);
+  if (terms.size === 0) terms.add(""); // no query: get recent jobs
+
+  const urls = [...terms].map(t =>
+    `${REMOTIVE_BASE}?${t ? `search=${encodeURIComponent(t)}&` : ""}limit=${MAX_RESULTS * 2}`
+  );
+  const pages = await Promise.allSettled(urls.map(safeFetchJson));
+
   const seen = new Set();
   const out  = [];
-
-  for (const term of terms) {
-    if (out.length >= MAX_RESULTS) break;
-    const url = `${REMOTIVE_BASE}?${term ? `search=${encodeURIComponent(term)}&` : ""}limit=${MAX_RESULTS}`;
-    const data = await safeFetchJson(url);
+  for (const p of pages) {
+    const data = p.status === "fulfilled" ? p.value : null;
     for (const job of data?.jobs || []) {
       const id = `rem-${job.id}`;
       if (seen.has(id)) continue;
       seen.add(id);
       out.push(shapeRemotive(job, id));
-      if (out.length >= MAX_RESULTS) break;
+      if (out.length >= CANDIDATE_CAP) return out;
     }
   }
   return out;
@@ -81,10 +102,9 @@ function shapeRemotive(job, id) {
   };
 }
 
-// ─── THE MUSE ────────────────────────────────────────────────────────────────
+// ─── FETCH: THE MUSE ─────────────────────────────────────────────────────────
 
-async function museSearch(query, mode) {
-  // Muse ignores `query`, so we fetch up to 3 pages and filter client-side.
+async function museFetch(mode) {
   const params = new URLSearchParams();
   if (mode === "boston") {
     params.append("location", "Boston, MA, US");
@@ -98,41 +118,20 @@ async function museSearch(query, mode) {
   const pageUrls = [1, 2, 3].map(p => `${MUSE_BASE}?${params}&page=${p}`);
   const pages    = await Promise.allSettled(pageUrls.map(safeFetchJson));
 
-  const terms = keywordTerms(query);
-  const seen  = new Set();
-  const out   = [];
-
+  const out = [];
   for (const p of pages) {
     const data = p.status === "fulfilled" ? p.value : null;
     for (const job of data?.results || []) {
-      if (!matchesTerms(job, terms)) continue;
-      const id = `muse-${job.id}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      out.push(shapeMuse(job, id));
-      if (out.length >= MAX_RESULTS) break;
+      out.push(shapeMuse(job, `muse-${job.id}`));
+      if (out.length >= CANDIDATE_CAP) return out;
     }
-    if (out.length >= MAX_RESULTS) break;
   }
   return out;
 }
 
-function matchesTerms(job, terms) {
-  if (terms.length === 0) return true;
-  // Deliberately excludes job.levels and job.locations — both are constrained
-  // by the request URL params, so they'd spuriously match tokens like "entry".
-  const hay = [
-    job.name,
-    job.company?.name,
-    (job.categories || []).map(c => c.name).join(" "),
-    stripHtml(job.contents || "").slice(0, 1200),
-  ].join(" ").toLowerCase();
-  return terms.some(t => hay.includes(t));
-}
-
 function shapeMuse(job, id) {
   const locations = (job.locations || []).map(l => l.name);
-  const remote = locations.some(n => /remote|flexible/i.test(n));
+  const remote    = locations.some(n => /remote|flexible/i.test(n));
   return {
     id,
     title:       job.name || "Job",
@@ -148,6 +147,78 @@ function shapeMuse(job, id) {
   };
 }
 
+// ─── RELEVANCE SCORING ───────────────────────────────────────────────────────
+//
+// Points:
+//   +15  exact phrase in title (only for multi-word queries)
+//   +10  every token has a stem-match in title (AND)
+//   + 5  any stem-match in title (per stem)
+//   + 3  any stem-match in category (per stem)
+//   + 2  every token has a stem-match in description (AND)
+// MIN_SCORE=5 means we require at least one solid title hit OR a phrase match.
+
+function scoreJob(job, a) {
+  if (!a.tokens.length) return 1;
+
+  const title = (job.title || "").toLowerCase();
+  const category = (job.category || "").toLowerCase();
+  const desc = (job.description || "").toLowerCase();
+
+  let score = 0;
+
+  if (a.phrase.includes(" ") && title.includes(a.phrase)) score += 15;
+
+  if (a.tokens.every(t => stemHit(title, t))) score += 10;
+
+  for (const s of a.stems) {
+    if (title.includes(s)) score += 5;
+  }
+  for (const s of a.stems) {
+    if (category.includes(s)) score += 3;
+  }
+  if (a.tokens.every(t => stemHit(desc, t))) score += 2;
+
+  return score;
+}
+
+// ─── QUERY ANALYSIS ──────────────────────────────────────────────────────────
+
+function analyze(query) {
+  const stop = new Set(["and", "the", "for", "with", "job", "jobs", "part", "time"]);
+  const phrase = query.toLowerCase().trim();
+  const tokens = phrase
+    .split(/[^a-z0-9]+/)
+    .filter(t => t.length >= 3 && !stop.has(t));
+
+  const stems = new Set();
+  for (const t of tokens) {
+    for (const v of stemVariants(t)) stems.add(v);
+  }
+  return { phrase, tokens, stems: [...stems] };
+}
+
+function stemVariants(term) {
+  const out = [term];
+  if (term.endsWith("ing") && term.length > 5) out.push(term.slice(0, -3)); // teaching → teach
+  if (term.endsWith("ers") && term.length > 4) out.push(term.slice(0, -3)); // designers → design
+  if (term.endsWith("er")  && term.length > 4) out.push(term.slice(0, -2)); // designer → design
+  if (term.endsWith("s")   && term.length > 3) out.push(term.slice(0, -1)); // bakers → baker
+  if (term.endsWith("ed")  && term.length > 4) out.push(term.slice(0, -2)); // baked → bak
+  return out;
+}
+
+function stemHit(text, term) {
+  return stemVariants(term).some(v => text.includes(v));
+}
+
+function mostDistinctiveToken(query) {
+  const stop = new Set(["and", "the", "for", "with", "job", "jobs", "part", "time", "remote", "entry"]);
+  const toks = query.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 4 && !stop.has(t));
+  if (!toks.length) return "";
+  // Prefer the longest token (tends to be the most content-bearing word).
+  return toks.sort((a, b) => b.length - a.length)[0];
+}
+
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 async function safeFetchJson(url) {
@@ -158,28 +229,6 @@ async function safeFetchJson(url) {
   } catch {
     return null;
   }
-}
-
-// Remotive is strict-phrase; ["graphic design", "graphic", ""] lets us degrade gracefully.
-function buildFallbackTerms(query) {
-  const q = query.toLowerCase().trim();
-  if (!q) return [""];
-  const first = q.split(/\s+/).find(t => t.length >= 3) || "";
-  const terms = [q];
-  if (first && first !== q) terms.push(first);
-  terms.push("");
-  return terms;
-}
-
-// For Muse client-side filter: tokenize and drop noise / stop-words.
-// Keep domain-meaningful tokens like "entry" (for "data entry") — only drop
-// pure connective words and self-describing noise.
-function keywordTerms(query) {
-  const stop = new Set(["and", "the", "for", "with", "job", "jobs"]);
-  return query
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(t => t.length >= 3 && !stop.has(t));
 }
 
 function stripHtml(html) {
