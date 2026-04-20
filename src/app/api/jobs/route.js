@@ -32,7 +32,7 @@ const CANDIDATE_CAP = 60;    // cap work per source so we don't hammer upstreams
 //     losing "Lead Generation Specialist" (rarely shows up in these APIs anyway)
 // "Executive Assistant" is intentionally NOT blocked (it's "assistant to an
 // executive", an accessible admin role).
-const SENIOR_TITLE_RE = /\b(senior|sr\.?|staff|principal|architect|director|distinguished|supervisor|advisor|chief|vp|manager|mgr\.?|head\s+of|lead|scientist|engineer|developer|consultant)\b/i;
+const SENIOR_TITLE_RE = /\b(senior|sr\.?|staff|principal|architect|director|distinguished|supervisor|advisor|chief|vp|manager|mgr\.?|head\s+of|lead|scientist|engineer|developer|consultant|special\s+agent)\b/i;
 
 // Job-title words that are too generic to be the "distinctive" match on their
 // own. "Office Assistant" must not count as a hit for "teaching assistant".
