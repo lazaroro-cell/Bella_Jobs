@@ -29,6 +29,10 @@ const GENERIC_TOKENS = new Set([
   "representative", "rep", "support", "agent", "lead", "senior", "junior",
   "director", "vp", "head", "chief", "officer", "worker", "staff",
   "entry", "intern", "internship", "contract", "temp",
+  // Qualifiers — too broad to serve as a distinctive match on their own
+  // (e.g. "digital" would otherwise let "Digital Customer Success" pass an
+  // "illustrator digital art" query).
+  "digital", "creative", "professional", "global",
 ]);
 
 // Words removed entirely before tokenization — pure connectives or modality
@@ -50,12 +54,15 @@ const SYNONYM_MAP = {
   bookkeep:    ["accountant", "accountancy", "accounting"],
   bookkeeper:  ["accountant", "accountancy", "accounting"],
   bookkeeping: ["accountant", "accountancy", "accounting"],
-  illustrator: ["artist", "illustrat"],
-  illustration:["illustrat", "artist"],
+  illustrator: ["artist", "illustrat", "graphics"],
+  illustration:["illustrat", "artist", "graphics"],
   baker:       ["pastry", "bakery"],
   baking:      ["baker", "pastry", "bakery"],
   pastry:      ["baker", "bakery"],
-  social:      ["community"],
+  // "Marketing Specialist" / "Content Marketing Manager" are adjacent to
+  // social-media work; letting these match expands Bella's options without
+  // opening the floodgates (only "social" maps to marketing, not "media").
+  social:      ["community", "marketing"],
 };
 
 // Maps Bella's query tokens to Jobicy tag slugs for bonus tag-filtered fetches.
