@@ -21,6 +21,13 @@ const MAX_RESULTS   = 15;
 const MIN_SCORE     = 5;     // below this, a candidate is considered irrelevant
 const CANDIDATE_CAP = 60;    // cap work per source so we don't hammer upstreams
 
+// Bella is an entry-level candidate looking for part-time work. Titles
+// matching this pattern are out of reach regardless of how well they score.
+// "Executive Assistant" is intentionally NOT blocked (it's "assistant to an
+// executive", an accessible admin role). "Lead" is not blocked because
+// "Lead Generation Specialist" is often entry-level.
+const SENIOR_TITLE_RE = /\b(senior|sr\.?|staff|principal|architect|director|distinguished|supervisor|advisor|chief|vp|manager|mgr\.?|head\s+of)\b/i;
+
 // Job-title words that are too generic to be the "distinctive" match on their
 // own. "Office Assistant" must not count as a hit for "teaching assistant".
 // Also level/tenure words — self-describing, not content.
@@ -103,6 +110,9 @@ export async function GET(request) {
   const scored = [];
   const noQuery = !analyzed.tokens.length || analyzed.allGeneric;
   for (const job of byId.values()) {
+    // Seniority cut: Bella is entry-level, so drop titles that imply
+    // years of experience. Applied even on the no-query fallback.
+    if (SENIOR_TITLE_RE.test(job.title || "")) continue;
     const score = scoreJob(job, analyzed);
     if (noQuery || score >= MIN_SCORE) {
       scored.push({ job, score });
