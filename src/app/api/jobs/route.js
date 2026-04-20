@@ -18,7 +18,7 @@ const REMOTIVE_BASE = "https://remotive.com/api/remote-jobs";
 const JOBICY_BASE   = "https://jobicy.com/api/v2/remote-jobs";
 const FETCH_OPTS    = { headers: { Accept: "application/json" }, next: { revalidate: 600 } };
 const MAX_RESULTS   = 15;
-const MIN_SCORE     = 7;     // below this, a candidate is considered irrelevant
+const MIN_SCORE     = 5;     // below this, a candidate is considered irrelevant
 const CANDIDATE_CAP = 60;    // cap work per source so we don't hammer upstreams
 
 // Job-title words that are too generic to be the "distinctive" match on their
@@ -38,6 +38,37 @@ const STOP_TOKENS = new Set([
   "remote", "online", "hybrid", "flexible", "flex",
 ]);
 
+// Synonyms for Bella's specific niches. Keys are query tokens; values are
+// additional prefix-match targets. Everything in stemVariants() plus these is
+// what we look for in titles/categories. Chosen surgically: "bookkeeping" →
+// "accounting" (not "account", which would falsely match "Account Manager").
+const SYNONYM_MAP = {
+  teach:       ["educat", "instruct", "tutor", "curriculum"],
+  teaching:    ["educat", "instruct", "tutor", "curriculum"],
+  teacher:     ["educat", "instruct", "tutor", "curriculum"],
+  preschool:   ["daycare", "childcare", "kindergarten", "toddler", "nursery"],
+  bookkeep:    ["accountant", "accountancy", "accounting"],
+  bookkeeper:  ["accountant", "accountancy", "accounting"],
+  bookkeeping: ["accountant", "accountancy", "accounting"],
+  illustrator: ["artist", "illustrat"],
+  illustration:["illustrat", "artist"],
+  baker:       ["pastry", "bakery"],
+  baking:      ["baker", "pastry", "bakery"],
+  pastry:      ["baker", "bakery"],
+  social:      ["community"],
+};
+
+// Maps Bella's query tokens to Jobicy tag slugs for bonus tag-filtered fetches.
+// Only tags that returned real content in probes are listed.
+const JOBICY_TAG_HINTS = [
+  { match: /\b(design|illustrat|graphic)/i,          tag: "design" },
+  { match: /\b(teach|educat|preschool|tutor)/i,      tag: "education" },
+  { match: /\b(social|media|marketing)/i,            tag: "marketing" },
+  { match: /\b(bookkeep|accounting)/i,               tag: "bookkeeping" },
+  { match: /\b(admin|administrative)/i,              tag: "admin" },
+  { match: /\b(finance|accountant)/i,                tag: "finance" },
+];
+
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const query    = (searchParams.get("q") || "").trim();
@@ -47,7 +78,7 @@ export async function GET(request) {
   const analyzed = analyze(query);
 
   const tasks = isRemote
-    ? [remotiveFetch(query), jobicyFetch(), museFetch("remote")]
+    ? [remotiveFetch(query), jobicyFetch(query), museFetch("remote")]
     : [museFetch("boston")];
 
   const settled = await Promise.allSettled(tasks);
@@ -125,16 +156,32 @@ function shapeRemotive(job, id) {
 }
 
 // ─── FETCH: JOBICY ───────────────────────────────────────────────────────────
-// Jobicy has no keyword search API — just pull a US-geo pool and let the
-// scorer filter. Broadens coverage for niches Remotive is thin on.
+// Jobicy has no keyword search API. We fetch a broad US-geo pool AND
+// additional tag-filtered pools hinted by the query (design, education,
+// marketing, etc). The scorer does the final filtering.
 
-async function jobicyFetch() {
-  const url = `${JOBICY_BASE}?count=50&geo=usa`;
-  const data = await safeFetchJson(url);
-  const out = [];
-  for (const job of data?.jobs || []) {
-    out.push(shapeJobicy(job, `job-${job.id}`));
-    if (out.length >= CANDIDATE_CAP) break;
+async function jobicyFetch(query) {
+  const urls = [`${JOBICY_BASE}?count=50&geo=usa`];
+  const seenTags = new Set();
+  for (const hint of JOBICY_TAG_HINTS) {
+    if (hint.match.test(query) && !seenTags.has(hint.tag)) {
+      seenTags.add(hint.tag);
+      urls.push(`${JOBICY_BASE}?count=30&tag=${hint.tag}`);
+    }
+  }
+
+  const pages = await Promise.allSettled(urls.map(safeFetchJson));
+  const seen = new Set();
+  const out  = [];
+  for (const p of pages) {
+    const data = p.status === "fulfilled" ? p.value : null;
+    for (const job of data?.jobs || []) {
+      const id = `job-${job.id}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(shapeJobicy(job, id));
+      if (out.length >= CANDIDATE_CAP) return out;
+    }
   }
   return out;
 }
@@ -261,11 +308,14 @@ function scoreJob(job, a) {
 
   if (a.tokens.every(t => prefixStemHit(title, t))) score += 10;
 
-  for (const s of a.stems) {
-    if (prefixHit(title, s)) score += 5;
+  // Per-token (not per-stem) — each token contributes at most +5/+3 regardless
+  // of how many of its stem/synonym variants hit, avoiding double-counts when
+  // e.g. "designer" matches both "designer" and "design" stems in one word.
+  for (const t of a.tokens) {
+    if (prefixStemHit(title, t)) score += 5;
   }
-  for (const s of a.stems) {
-    if (prefixHit(category, s)) score += 3;
+  for (const t of a.tokens) {
+    if (prefixStemHit(category, t)) score += 3;
   }
   if (a.tokens.every(t => prefixStemHit(desc, t))) score += 2;
 
@@ -280,7 +330,11 @@ function prefixHit(text, term) {
 }
 
 function prefixStemHit(text, term) {
-  return stemVariants(term).some(v => prefixHit(text, v));
+  // Combines morphology (stemVariants) and domain synonyms (SYNONYM_MAP).
+  // Each variant is checked as a prefix match at a word boundary, so
+  // "accountant" matches \baccountant but "Account Manager" does not.
+  const variants = [...stemVariants(term), ...(SYNONYM_MAP[term] || [])];
+  return variants.some(v => prefixHit(text, v));
 }
 
 // ─── QUERY ANALYSIS ──────────────────────────────────────────────────────────
