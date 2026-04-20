@@ -16,6 +16,7 @@
 const MUSE_BASE     = "https://www.themuse.com/api/public/jobs";
 const REMOTIVE_BASE = "https://remotive.com/api/remote-jobs";
 const JOBICY_BASE   = "https://jobicy.com/api/v2/remote-jobs";
+const ADZUNA_BASE   = "https://api.adzuna.com/v1/api/jobs/us/search/1";
 const FETCH_OPTS    = { headers: { Accept: "application/json" }, next: { revalidate: 600 } };
 const MAX_RESULTS   = 15;
 const MIN_SCORE     = 5;     // below this, a candidate is considered irrelevant
@@ -98,8 +99,8 @@ export async function GET(request) {
   const analyzed = analyze(query);
 
   const tasks = isRemote
-    ? [remotiveFetch(query), jobicyFetch(query), museFetch("remote")]
-    : [museFetch("boston")];
+    ? [remotiveFetch(query), jobicyFetch(query), museFetch("remote"), adzunaFetch(query, "remote")]
+    : [museFetch("boston"), adzunaFetch(query, "boston")];
 
   const settled = await Promise.allSettled(tasks);
   const candidates = [];
@@ -230,6 +231,63 @@ function shapeJobicy(job, id) {
     remote:      true,
     type,
     category:    industry,
+  };
+}
+
+// ─── FETCH: ADZUNA ───────────────────────────────────────────────────────────
+// Real Boston-area local listings. Requires ADZUNA_APP_ID + ADZUNA_APP_KEY as
+// Vercel env vars — if unset, we skip silently so the rest of the site works.
+// This is the source that actually covers cafes, daycares, bookkeepers, and
+// small businesses — the entry-level supply the other three APIs lack.
+
+async function adzunaFetch(query, mode) {
+  const appId  = process.env.ADZUNA_APP_ID;
+  const appKey = process.env.ADZUNA_APP_KEY;
+  if (!appId || !appKey) return [];
+
+  const params = new URLSearchParams({
+    app_id: appId,
+    app_key: appKey,
+    results_per_page: "30",
+    sort_by: "date",
+  });
+  if (query) params.set("what", query);
+  if (mode === "boston") {
+    params.set("where", "Boston, MA");
+    params.set("distance", "25");  // miles; covers Malden/Cambridge/Somerville/Quincy
+  } else {
+    // Adzuna's "remote" filter is fuzzy; pass it as a keyword instead and let
+    // the scorer + seniority filter do the rest.
+    const what = query ? `${query} remote` : "remote";
+    params.set("what", what);
+  }
+
+  const data = await safeFetchJson(`${ADZUNA_BASE}?${params}`);
+  const out = [];
+  for (const job of data?.results || []) {
+    out.push(shapeAdzuna(job, `adz-${job.id}`));
+    if (out.length >= CANDIDATE_CAP) break;
+  }
+  return out;
+}
+
+function shapeAdzuna(job, id) {
+  const loc = job.location?.display_name || "Boston area";
+  const salary = (job.salary_min && job.salary_max)
+    ? `$${Math.round(job.salary_min / 1000)}k–$${Math.round(job.salary_max / 1000)}k`
+    : null;
+  return {
+    id,
+    title:       job.title || "Job",
+    company:     job.company?.display_name || "Company",
+    location:    loc,
+    description: stripHtml(job.description || "").slice(0, 350),
+    salary,
+    posted:      formatDate(job.created),
+    url:         job.redirect_url,
+    remote:      /remote/i.test(loc) || /remote/i.test(job.title || ""),
+    type:        job.contract_time || job.contract_type || "See listing",
+    category:    job.category?.label || "",
   };
 }
 
