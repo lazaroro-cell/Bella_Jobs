@@ -1,4 +1,4 @@
-// Free APIs: Remotive (remote jobs) + The Muse (Boston + remote)
+// Free APIs: Remotive + Jobicy (remote) + The Muse (Boston + remote)
 // No API keys required. Paid plans not used.
 //
 // Design notes:
@@ -6,12 +6,16 @@
 //     matching must happen here after the fetch.
 //   - Remotive's `search` is strict phrase-match: "graphic design" → 0 while
 //     "designer" → many. We fetch both strict and loose, then re-rank.
+//   - Jobicy has no keyword search — we fetch a US-geo pool and let the
+//     scorer filter. Adds coverage for niches Remotive is thin on (education,
+//     bookkeeping, etc).
 //   - We score every candidate with a title-weighted relevance function and
 //     drop anything below MIN_SCORE. Fewer, accurate results beat a long list
 //     of "Office Assistant" for a "graphic designer" search.
 
 const MUSE_BASE     = "https://www.themuse.com/api/public/jobs";
 const REMOTIVE_BASE = "https://remotive.com/api/remote-jobs";
+const JOBICY_BASE   = "https://jobicy.com/api/v2/remote-jobs";
 const FETCH_OPTS    = { headers: { Accept: "application/json" }, next: { revalidate: 600 } };
 const MAX_RESULTS   = 15;
 const MIN_SCORE     = 7;     // below this, a candidate is considered irrelevant
@@ -43,7 +47,7 @@ export async function GET(request) {
   const analyzed = analyze(query);
 
   const tasks = isRemote
-    ? [remotiveFetch(query), museFetch("remote")]
+    ? [remotiveFetch(query), jobicyFetch(), museFetch("remote")]
     : [museFetch("boston")];
 
   const settled = await Promise.allSettled(tasks);
@@ -117,6 +121,45 @@ function shapeRemotive(job, id) {
     remote:      true,
     type:        job.job_type || "Full-time",
     category:    job.category || "",
+  };
+}
+
+// ─── FETCH: JOBICY ───────────────────────────────────────────────────────────
+// Jobicy has no keyword search API — just pull a US-geo pool and let the
+// scorer filter. Broadens coverage for niches Remotive is thin on.
+
+async function jobicyFetch() {
+  const url = `${JOBICY_BASE}?count=50&geo=usa`;
+  const data = await safeFetchJson(url);
+  const out = [];
+  for (const job of data?.jobs || []) {
+    out.push(shapeJobicy(job, `job-${job.id}`));
+    if (out.length >= CANDIDATE_CAP) break;
+  }
+  return out;
+}
+
+function shapeJobicy(job, id) {
+  const industry = Array.isArray(job.jobIndustry) ? job.jobIndustry.join(", ")
+                 : (job.jobIndustry || "");
+  const type     = Array.isArray(job.jobType) ? job.jobType[0]
+                 : (job.jobType || "Full-Time");
+  const salary   = (job.annualSalaryMin && job.annualSalaryMax)
+    ? `$${job.annualSalaryMin}–$${job.annualSalaryMax}`
+    : null;
+  const excerpt  = stripHtml(job.jobExcerpt || job.jobDescription || "").slice(0, 350);
+  return {
+    id,
+    title:       job.jobTitle || "Job",
+    company:     job.companyName || "Company",
+    location:    job.jobGeo || "Remote",
+    description: excerpt,
+    salary,
+    posted:      formatDate(job.pubDate),
+    url:         job.url,
+    remote:      true,
+    type,
+    category:    industry,
   };
 }
 
