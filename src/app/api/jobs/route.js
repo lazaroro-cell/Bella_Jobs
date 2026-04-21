@@ -108,7 +108,7 @@ export async function GET(request) {
     if (s.status === "fulfilled" && Array.isArray(s.value)) candidates.push(...s.value);
   }
 
-  // Dedupe first (same id could come from both sources, or across fallback terms)
+  // Dedupe by source-prefixed id (same result appearing across fallback terms).
   const byId = new Map();
   for (const job of candidates) {
     if (!byId.has(job.id)) byId.set(job.id, job);
@@ -127,8 +127,28 @@ export async function GET(request) {
   }
   scored.sort((a, b) => b.score - a.score);
 
-  const jobs = scored.slice(0, MAX_RESULTS).map(x => x.job);
+  // Second dedupe: same (company, title) posted across multiple cities looks
+  // like different jobs to Bella but they're the same posting. Keep the
+  // highest-scoring copy (first after sort). Runs after sort so the best
+  // location survives.
+  const seenKey = new Set();
+  const jobs = [];
+  for (const { job } of scored) {
+    const key = dedupeKey(job);
+    if (seenKey.has(key)) continue;
+    seenKey.add(key);
+    jobs.push(job);
+    if (jobs.length >= MAX_RESULTS) break;
+  }
   return Response.json({ jobs, total: jobs.length });
+}
+
+// Normalize for dedupe: lowercase, collapse punctuation/whitespace. So
+// "Macy's, Inc." and "macys inc" hash the same; "Legal Administrative
+// Assistant " and "legal administrative assistant" too.
+function dedupeKey(job) {
+  const norm = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  return `${norm(job.company)}|${norm(job.title)}`;
 }
 
 // ─── FETCH: REMOTIVE ─────────────────────────────────────────────────────────
