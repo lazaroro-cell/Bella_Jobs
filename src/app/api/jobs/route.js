@@ -192,6 +192,7 @@ function shapeRemotive(job, id) {
     description: stripHtml(job.description || "").slice(0, 350),
     salary:      job.salary || null,
     posted:      formatDate(job.publication_date),
+    postedAt:    job.publication_date || null,
     url:         job.url,
     remote:      true,
     type:        job.job_type || "Full-time",
@@ -247,6 +248,7 @@ function shapeJobicy(job, id) {
     description: excerpt,
     salary,
     posted:      formatDate(job.pubDate),
+    postedAt:    job.pubDate || null,
     url:         job.url,
     remote:      true,
     type,
@@ -304,6 +306,7 @@ function shapeAdzuna(job, id) {
     description: stripHtml(job.description || "").slice(0, 350),
     salary,
     posted:      formatDate(job.created),
+    postedAt:    job.created || null,
     url:         job.redirect_url,
     remote:      /remote/i.test(loc) || /remote/i.test(job.title || ""),
     type:        job.contract_time || job.contract_type || "See listing",
@@ -349,6 +352,7 @@ function shapeMuse(job, id) {
     description: stripHtml(job.contents || "").slice(0, 350),
     salary:      null,
     posted:      formatDate(job.publication_date),
+    postedAt:    job.publication_date || null,
     url:         job.refs?.landing_page || `https://www.themuse.com/jobs/${job.id}`,
     remote,
     type:        "See listing",
@@ -380,7 +384,8 @@ function scoreJob(job, a) {
   // No content tokens (empty query, or tokens entirely generic like "entry"):
   // skip filtering and treat everything as a potential match. This is what
   // makes the "Any Remote" pill (q="remote part time entry" → ["entry"]) work.
-  if (!a.tokens.length || a.allGeneric) return 1;
+  // Still apply freshness so fresh jobs float to the top of the fallback list.
+  if (!a.tokens.length || a.allGeneric) return 1 + freshnessBoost(job);
 
   const title = (job.title || "").toLowerCase();
   const category = (job.category || "").toLowerCase();
@@ -420,7 +425,25 @@ function scoreJob(job, a) {
   }
   if (a.tokens.every(t => prefixStemHit(desc, t))) score += 2;
 
+  score += freshnessBoost(job);
+
   return score;
+}
+
+// Freshness boost: recently-posted jobs are more likely to still be open and
+// less picked-over. Values are small relative to the main score buckets
+// (+15 phrase, +10 all-tokens) so relevance still dominates; freshness is
+// a tiebreaker and gentle ranking nudge.
+function freshnessBoost(job) {
+  if (!job.postedAt) return 0;
+  const ms = Date.now() - new Date(job.postedAt).getTime();
+  if (isNaN(ms)) return 0;
+  const days = ms / 86400000;
+  if (days <= 1)  return 3;   // today / yesterday
+  if (days <= 3)  return 2;   // last 3 days
+  if (days <= 7)  return 1;   // last week
+  if (days <= 14) return 0.5; // last 2 weeks
+  return 0;
 }
 
 // Left-bounded: term must start at a word boundary but the word can continue.
